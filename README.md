@@ -22,7 +22,102 @@ class LearnableMPP(nn.Module):
                         'b c w d h -> b c h w', 'sum')
         
         return self.conv(torch.cat([axial, sagittal, coronal], dim=1))
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
+class nnUNet3DBlock(nn.Module):
+    """Modified 3D nnUNet block with adaptive depth-wise convolutions"""
+    def __init__(self, 
+                 in_channels: int, 
+                 out_channels: int,
+                 kernel_size: Tuple[int, int, int] = (3, 3, 3),
+                 stride: Tuple[int, int, int] = (1, 1, 1),
+                 num_groups: int = 8):
+        super().__init__()
+        
+        # Depth-wise separable convolution for efficiency
+        self.dw_conv = nn.Conv3d(in_channels, in_channels, 
+                                kernel_size=kernel_size,
+                                stride=stride,
+                                padding=tuple(k//2 for k in kernel_size),
+                                groups=in_channels)
+        
+        # Point-wise convolution
+        self.pw_conv = nn.Conv3d(in_channels, out_channels, 
+                                kernel_size=1)
+        
+        # Adaptive normalization
+        self.norm = nn.GroupNorm(num_groups, out_channels)
+        self.act = nn.LeakyReLU(0.01)  # Better for medical images
+        
+        # Residual connection
+        self.residual = nn.Sequential()
+        if in_channels != out_channels or any(s > 1 for s in stride):
+            self.residual = nn.Sequential(
+                nn.Conv3d(in_channels, out_channels, 
+                         kernel_size=1, stride=stride),
+                nn.GroupNorm(num_groups, out_channels)
+            )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        residual = self.residual(x)
+        
+        # Depth-wise separable convolution
+        x = self.dw_conv(x)
+        x = self.pw_conv(x)
+        
+        # Normalization and activation
+        x = self.norm(x)
+        x = self.act(x + residual)
+        
+        return x
+
+class nnUNet3D(nn.Module):
+    """Complete 3D nnUNet encoder adapted for MMG-SiamNet"""
+    def __init__(self, 
+                 in_channels: int = 1,
+                 base_channels: int = 32,
+                 num_blocks: int = 4):
+        super().__init__()
+        
+        # Initial convolution
+        self.init_conv = nn.Sequential(
+            nn.Conv3d(in_channels, base_channels, 
+                     kernel_size=(3, 3, 3), padding=1),
+            nn.GroupNorm(8, base_channels),
+            nn.LeakyReLU(0.01)
+        )
+        
+        # Downsampling blocks
+        self.blocks = nn.ModuleList()
+        current_channels = base_channels
+        
+        for i in range(num_blocks):
+            out_channels = current_channels * 2 if i < num_blocks - 1 else current_channels
+            
+            self.blocks.append(
+                nn.Sequential(
+                    nnUNet3DBlock(current_channels, out_channels,
+                                stride=(1, 2, 2) if i == 0 else (2, 2, 2)),
+                    nnUNet3DBlock(out_channels, out_channels)
+                )
+            )
+            current_channels = out_channels
+            
+        # Feature refinement
+        self.final_conv = nn.Conv3d(current_channels, current_channels,
+                                   kernel_size=1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        features = []
+        x = self.init_conv(x)
+        
+        for block in self.blocks:
+            x = block(x)
+            features.append(x)  # For skip connections
+            
+        return self.final_conv(x), features  # Return both final features and skips
 class DeformableSTN(nn.Module):
     """Deformable Spatial Transformer with Edge Awareness"""
     def __init__(self, in_channels: int):
@@ -103,7 +198,16 @@ class MMG_SiamNet(nn.Module):
         # Uncertainty
         self.dropout = nn.Dropout2d(dropout_rate)
         self.mc_samples = mc_samples
+       def __init__(self):
+        super().__init__()
+        self.encoder_3d = nnUNet3D(in_channels=1, base_channels=32)
         
+    def forward(self, x3d):
+        # x3d: [B, 1, 64, 64, 64]
+        features_3d, skips_3d = self.encoder_3d(x3d) 
+        # features_3d: [B, 256, 4, 4, 4]
+        # skips_3d: List of features at different scales
+        return features_3d 
     def forward(self, 
                x2d: torch.Tensor, 
                x3d: torch.Tensor
